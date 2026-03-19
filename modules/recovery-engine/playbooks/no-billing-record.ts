@@ -1,8 +1,13 @@
 /**
- * Missing Invoice Playbook
+ * No Billing Record Playbook
  *
- * Detects CRM deals marked "Closed Won" that have no corresponding
- * invoice in Stripe, and enables safe automated recovery.
+ * Detects CRM deals marked "Closed Won" where the customer has
+ * NO Stripe presence at all — either no Stripe customer exists,
+ * or the customer exists but has zero invoices.
+ *
+ * Different from missing-invoice: that playbook checks if a specific
+ * deal has a matching invoice. This playbook checks if the customer
+ * has ANY billing presence whatsoever.
  *
  * Production-safe: idempotent, no duplicates, fail-safe execution.
  *
@@ -22,12 +27,9 @@ import type {
 } from "../types.js";
 import * as store from "../storage/recoveryStore.js";
 
-const PLAYBOOK_TYPE: PlaybookType = "missing_invoice";
+const PLAYBOOK_TYPE: PlaybookType = "no_billing_record";
 
 /* ── Constants ─────────────────────────────────────────────────────── */
-
-/** Amount tolerance for invoice matching (±2%) */
-const AMOUNT_TOLERANCE = 0.02;
 
 /** Minimum hours since deal close before we flag it (24h) */
 const MIN_AGE_HOURS = 24;
@@ -65,37 +67,24 @@ function daysSince(isoDate: string): number {
 /* ── Credit cost calculation ───────────────────────────────────────── */
 
 function calcCreditsRequired(amount: number): number {
-  if (amount > 10000) return Math.floor(amount / 100);
-  if (amount > 5000) return Math.floor(amount / 80);
-  return Math.floor(amount / 50);
+  return Math.round(amount / 100);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * INVOICE MATCHING
- * Checks if a deal already has a corresponding Stripe invoice.
+ * BILLING PRESENCE CHECK
  *
- * Match criteria (any of):
- *   1. Invoice metadata.dealId === deal.id (system-created)
- *   2. Same customer + amount within ±2% tolerance
+ * Returns true if customer has ANY billing presence in Stripe:
+ *   - At least one invoice (any status) for their customer ID
  * ═══════════════════════════════════════════════════════════════════ */
 
-function hasMatchingInvoice(deal: DealInput, invoices: InvoiceInput[]): boolean {
-  return invoices.some((inv) => {
-    // Match by metadata (system-created invoices)
-    if (inv.metadata?.dealId === deal.id) return true;
-    if (inv.metadata?.source === "integrale_recovery" && inv.metadata?.dealId === deal.id) return true;
-
-    // Match by customer + amount within tolerance
-    if (inv.customerId !== deal.customerId) return false;
-    const amountDiff = Math.abs(inv.amount - deal.amount) / deal.amount;
-    return amountDiff <= AMOUNT_TOLERANCE;
-  });
+function customerHasBillingRecord(customerId: string, invoices: InvoiceInput[]): boolean {
+  return invoices.some((inv) => inv.customerId === customerId);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * detect()
  *
- * Returns all Closed Won deals with no matching Stripe invoice.
+ * Returns Closed Won deals where the customer has NO billing record.
  * Pure function — no side effects, no mutations.
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -107,8 +96,8 @@ function detect(deals: DealInput[], invoices: InvoiceInput[]): RecoveryOpportuni
   );
 
   for (const deal of closedWon) {
-    // Skip if already matched to an invoice
-    if (hasMatchingInvoice(deal, invoices)) continue;
+    // Skip if customer has ANY billing record
+    if (customerHasBillingRecord(deal.customerId, invoices)) continue;
 
     // Skip if already successfully recovered
     if (store.isDealHandled(deal.id)) continue;
@@ -116,7 +105,7 @@ function detect(deals: DealInput[], invoices: InvoiceInput[]): RecoveryOpportuni
     const age = daysSince(deal.closeDate);
 
     opportunities.push({
-      id: `recovery-mi-${deal.id}`,
+      id: `recovery-nbr-${deal.id}`,
       playbook: PLAYBOOK_TYPE,
       dealId: deal.id,
       customerId: deal.customerId,
@@ -126,14 +115,14 @@ function detect(deals: DealInput[], invoices: InvoiceInput[]): RecoveryOpportuni
       amount: deal.amount,
       currency: deal.currency,
       closeDate: deal.closeDate,
-      description: `Revenue mismatch detected — "${deal.name}" closed ${age} day${age !== 1 ? "s" : ""} ago, not reflected across connected systems`,
+      description: `Revenue not recorded across systems — "${deal.name}" (${deal.company}) closed ${age} day${age !== 1 ? "s" : ""} ago, not reflected in billing`,
       confidence: "high",
       creditsRequired: calcCreditsRequired(deal.amount),
       source: deal.source,
     });
   }
 
-  // Sort by amount descending (highest value first)
+  // Sort by amount descending
   opportunities.sort((a, b) => b.amount - a.amount);
   return opportunities;
 }
@@ -142,24 +131,19 @@ function detect(deals: DealInput[], invoices: InvoiceInput[]): RecoveryOpportuni
  * validate()
  *
  * Returns true only if the opportunity is safe to recover.
- * Checks: amount > 0, valid email, not test/internal, ≥24h old,
- * not previously handled.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function validate(opportunity: RecoveryOpportunity): ValidationResult {
   const reasons: string[] = [];
 
-  // Amount must be positive
   if (opportunity.amount <= 0) {
     reasons.push("Deal amount must be greater than zero");
   }
 
-  // Valid email
   if (!EMAIL_REGEX.test(opportunity.customerEmail)) {
     reasons.push(`Invalid customer email: ${opportunity.customerEmail}`);
   }
 
-  // Not test/internal
   const dealText = `${opportunity.dealName} ${opportunity.company}`.toLowerCase();
   for (const pattern of EXCLUDED_PATTERNS) {
     if (pattern.test(dealText)) {
@@ -175,12 +159,10 @@ function validate(opportunity: RecoveryOpportunity): ValidationResult {
     reasons.push(`Deal closed less than 24 hours ago (${Math.round(ageHours)}h)`);
   }
 
-  // Not already handled
   if (store.isDealHandled(opportunity.dealId)) {
     reasons.push("This deal has already been successfully recovered");
   }
 
-  // Not currently being processed
   if (store.hasActiveAction(opportunity.id)) {
     reasons.push("A recovery action is already in progress for this opportunity");
   }
@@ -193,8 +175,6 @@ function validate(opportunity: RecoveryOpportunity): ValidationResult {
 
 /* ═══════════════════════════════════════════════════════════════════
  * estimate()
- *
- * Returns amount, confidence, and credit cost.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function estimate(opportunity: RecoveryOpportunity): EstimationResult {
@@ -207,8 +187,6 @@ function estimate(opportunity: RecoveryOpportunity): EstimationResult {
 
 /* ═══════════════════════════════════════════════════════════════════
  * preview() — DRY RUN
- *
- * Returns a structured action plan. Executes NOTHING.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function preview(opportunity: RecoveryOpportunity): PreviewResult {
@@ -233,37 +211,17 @@ function preview(opportunity: RecoveryOpportunity): PreviewResult {
 
 /* ═══════════════════════════════════════════════════════════════════
  * execute() — SAFE EXECUTION
- *
- * Creates a Stripe invoice and updates CRM. Production-safe:
- *   - Idempotency check (no duplicate invoices)
- *   - Atomic action record (pending → success/failed)
- *   - Simulated Stripe/HubSpot calls (swap for real SDK)
- *
- * ⚠️  All execution goes through safeExecute wrapper below.
  * ═══════════════════════════════════════════════════════════════════ */
 
 async function execute(opportunity: RecoveryOpportunity): Promise<ExecutionResult> {
   return safeExecute(opportunity);
 }
 
-/**
- * safeExecute() — Production-grade execution wrapper
- *
- * Safety guarantees enforced in order:
- *   1. Rate limiting (max concurrent + per-minute)
- *   2. Idempotency (deal already recovered → no-op)
- *   3. Preview enforcement (must preview before execute)
- *   4. Execution lock (no parallel execution on same deal)
- *   5. Validation (amount, email, age, exclusions)
- *   6. Stripe duplicate check (metadata.dealId)
- *   7. Atomic action record (pending → success | failed)
- *   8. Lock release (always, even on failure)
- */
 async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionResult> {
   const executedActions: string[] = [];
   const now = new Date().toISOString();
 
-  // ── Gate 1: Rate limiting ──────────────────────────────────────
+  // ── Gate 1: Rate limiting
   const rateCheck = store.checkRateLimit();
   if (!rateCheck.allowed) {
     return {
@@ -276,7 +234,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     };
   }
 
-  // ── Gate 2: Idempotency check ──────────────────────────────────
+  // ── Gate 2: Idempotency check
   if (store.isDealHandled(opportunity.dealId)) {
     const action = store.createAction({
       playbookType: PLAYBOOK_TYPE,
@@ -288,14 +246,14 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     return {
       opportunityId: opportunity.id,
       success: false,
-      error: "Deal already recovered — invoice exists",
+      error: "Deal already recovered — billing record exists",
       errorType: "already_handled",
       executedAt: now,
       actions: ["Idempotency check: deal already handled — no action taken"],
     };
   }
 
-  // ── Gate 3: Preview enforcement + state hash validation ────────
+  // ── Gate 3: Preview enforcement + state hash validation
   const currentHash = store.computeStateHash(opportunity);
   const previewCheck = store.validatePreviewToken(opportunity.id, currentHash);
   if (!previewCheck.valid) {
@@ -309,7 +267,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     };
   }
 
-  // ── Gate 4: Execution lock (prevent parallel execution) ────────
+  // ── Gate 4: Execution lock
   const lockResult = store.acquireLock(opportunity.dealId, opportunity.id);
   if (!lockResult.acquired) {
     return {
@@ -323,7 +281,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
   }
 
   try {
-    // ── Gate 5: Validation ─────────────────────────────────────────
+    // ── Gate 5: Validation
     const validation = validate(opportunity);
     if (!validation.valid) {
       return {
@@ -336,26 +294,23 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
       };
     }
 
-    // ── Gate 6: Stripe duplicate check ─────────────────────────────
-    const duplicateCheck = await checkStripeDuplicate(opportunity.dealId);
-    if (duplicateCheck.exists) {
-      store.createAction({
-        playbookType: PLAYBOOK_TYPE,
-        dealId: opportunity.dealId,
-        opportunityId: opportunity.id,
-        metadata: { reason: "stripe_duplicate_detected", existingInvoiceId: duplicateCheck.invoiceId },
-      });
-      return {
-        opportunityId: opportunity.id,
-        success: false,
-        error: `Stripe invoice already exists for this deal (${duplicateCheck.invoiceId})`,
-        errorType: "duplicate_detected",
-        executedAt: now,
-        actions: [`Stripe duplicate detected: ${duplicateCheck.invoiceId} — no action taken`],
-      };
+    // ── Gate 6: Re-check billing presence (may have changed since scan)
+    const existingCustomer = await checkStripeCustomerExists(opportunity.customerEmail);
+    if (existingCustomer.exists) {
+      const hasInvoices = await checkCustomerHasInvoices(existingCustomer.customerId!);
+      if (hasInvoices) {
+        return {
+          opportunityId: opportunity.id,
+          success: false,
+          error: "Customer now has billing records — no action needed",
+          errorType: "duplicate_detected",
+          executedAt: now,
+          actions: ["Re-check: customer billing records found — no action taken"],
+        };
+      }
     }
 
-    // ── Step 1: Create action record (pending) ────────────────────
+    // ── Step 1: Create action record
     const action = store.createAction({
       playbookType: PLAYBOOK_TYPE,
       dealId: opportunity.dealId,
@@ -369,16 +324,15 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
       },
     });
 
-    // Track structured counts for summary
     let invoicesCreated = 0;
     let dealsUpdated = 0;
 
     try {
-      // ── Step 2: Ensure Stripe customer exists ───────────────────
-      const customerId = await ensureStripeCustomer(opportunity);
-      executedActions.push(`Verified Stripe customer: ${customerId}`);
+      // ── Step 2: Create Stripe customer
+      const customerId = await createStripeCustomer(opportunity);
+      executedActions.push(`Created Stripe customer: ${customerId} (${opportunity.customerEmail})`);
 
-      // ── Step 3: Create Stripe invoice ───────────────────────────
+      // ── Step 3: Create Stripe invoice
       const invoiceId = await createStripeInvoice({
         customerId,
         amount: opportunity.amount,
@@ -388,19 +342,20 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
       executedActions.push(`Created Stripe invoice: ${invoiceId} for ${fmtEur(opportunity.amount)}`);
       invoicesCreated++;
 
-      // ── Step 4: Update CRM deal ─────────────────────────────────
+      // ── Step 4: Update CRM deal
       await updateHubSpotDeal(opportunity.dealId, {
         invoiced: true,
         invoiceId,
         invoiceCreatedAt: now,
+        stripeCustomerId: customerId,
       });
-      executedActions.push(`Updated CRM deal ${opportunity.dealId}: invoiced=true`);
+      executedActions.push(`Updated CRM deal ${opportunity.dealId}: invoiced=true, stripeCustomerId=${customerId}`);
       dealsUpdated++;
 
-      // ── Step 5: Mark action as success + consume preview ────────
+      // ── Step 5: Mark success + consume preview
       store.updateAction(action.id, {
         status: "success",
-        metadata: { invoiceId, completedActions: executedActions },
+        metadata: { invoiceId, customerId, completedActions: executedActions },
       });
       store.consumePreviewToken(opportunity.id);
       executedActions.push(`Logged recovery action: ${action.id}`);
@@ -424,7 +379,6 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
         status: "failed",
         metadata: { error: errorMsg, completedActions: executedActions },
       });
-
       return {
         opportunityId: opportunity.id,
         success: false,
@@ -442,42 +396,37 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
 /* ═══════════════════════════════════════════════════════════════════
  * SIMULATED EXTERNAL CALLS
  *
- * These simulate Stripe and HubSpot API calls.
- * In production, replace with real SDK calls:
- *   - stripe.customers.create() / stripe.invoices.create()
- *   - hubspot.crm.deals.basicApi.update()
+ * In production, replace with real Stripe/HubSpot SDK calls.
  * ═══════════════════════════════════════════════════════════════════ */
 
-let invoiceCounter = 1000;
+let invoiceCounter = 2000;
+let customerCounter = 100;
 
-/**
- * Check Stripe for existing invoices with matching dealId metadata.
- * Prevents creating duplicate invoices even if our store was reset.
- *
- * In production: stripe.invoices.list({ metadata: { dealId } })
- */
-async function checkStripeDuplicate(dealId: string): Promise<{ exists: boolean; invoiceId?: string }> {
-  // Simulate Stripe metadata lookup
+async function checkStripeCustomerExists(email: string): Promise<{ exists: boolean; customerId?: string }> {
   await new Promise((r) => setTimeout(r, 50));
-
-  // In production:
-  // const existing = await stripe.invoices.list({
-  //   limit: 1,
-  //   metadata: { dealId, source: "integrale_recovery" },
-  // });
-  // if (existing.data.length > 0) {
-  //   return { exists: true, invoiceId: existing.data[0].id };
-  // }
-
-  // Simulated: check our local counter-based IDs (no duplicates in simulation)
+  // In production: stripe.customers.list({ email, limit: 1 })
   return { exists: false };
 }
 
-async function ensureStripeCustomer(opportunity: RecoveryOpportunity): Promise<string> {
-  // Simulate: check if customer exists, create if not
-  await new Promise((r) => setTimeout(r, 150));
-  // In production: stripe.customers.list({ email }) or stripe.customers.create()
-  return opportunity.customerId || `cus_${opportunity.customerEmail.replace(/[^a-z0-9]/gi, "")}`;
+async function checkCustomerHasInvoices(customerId: string): Promise<boolean> {
+  await new Promise((r) => setTimeout(r, 50));
+  // In production: stripe.invoices.list({ customer: customerId, limit: 1 })
+  return false;
+}
+
+async function createStripeCustomer(opportunity: RecoveryOpportunity): Promise<string> {
+  await new Promise((r) => setTimeout(r, 200));
+  const customerId = `cus_integrale_${++customerCounter}`;
+  // In production:
+  // const customer = await stripe.customers.create({
+  //   email: opportunity.customerEmail,
+  //   name: opportunity.company,
+  //   metadata: { source: "integrale_recovery", dealId: opportunity.dealId },
+  // });
+  console.log(
+    `[Recovery:NBR] Created Stripe customer ${customerId}: ${opportunity.customerEmail} (${opportunity.company})`,
+  );
+  return customerId;
 }
 
 async function createStripeInvoice(params: {
@@ -486,33 +435,11 @@ async function createStripeInvoice(params: {
   currency: string;
   dealId: string;
 }): Promise<string> {
-  // Simulate Stripe invoice creation
   await new Promise((r) => setTimeout(r, 300));
-
   const invoiceId = `inv_integrale_${++invoiceCounter}`;
-
-  // In production:
-  // const invoice = await stripe.invoices.create({
-  //   customer: params.customerId,
-  //   collection_method: "send_invoice",
-  //   days_until_due: 30,
-  //   metadata: {
-  //     dealId: params.dealId,
-  //     source: "integrale_recovery",
-  //   },
-  // });
-  // await stripe.invoiceItems.create({
-  //   customer: params.customerId,
-  //   invoice: invoice.id,
-  //   amount: params.amount * 100, // cents
-  //   currency: params.currency.toLowerCase(),
-  // });
-  // await stripe.invoices.finalizeInvoice(invoice.id);
-
   console.log(
-    `[Recovery] Created invoice ${invoiceId}: ${params.amount} ${params.currency} for customer ${params.customerId} (deal: ${params.dealId})`,
+    `[Recovery:NBR] Created invoice ${invoiceId}: ${params.amount} ${params.currency} for customer ${params.customerId} (deal: ${params.dealId})`,
   );
-
   return invoiceId;
 }
 
@@ -520,20 +447,9 @@ async function updateHubSpotDeal(
   dealId: string,
   properties: Record<string, unknown>,
 ): Promise<void> {
-  // Simulate HubSpot deal update
   await new Promise((r) => setTimeout(r, 150));
-
-  // In production:
-  // await hubspotClient.crm.deals.basicApi.update(dealId, {
-  //   properties: {
-  //     invoiced: "true",
-  //     invoice_id: properties.invoiceId,
-  //     invoice_created_at: properties.invoiceCreatedAt,
-  //   },
-  // });
-
   console.log(
-    `[Recovery] Updated HubSpot deal ${dealId}:`,
+    `[Recovery:NBR] Updated HubSpot deal ${dealId}:`,
     JSON.stringify(properties),
   );
 }
@@ -542,7 +458,7 @@ async function updateHubSpotDeal(
  * EXPORT — Playbook interface
  * ═══════════════════════════════════════════════════════════════════ */
 
-export const MissingInvoicePlaybook: Playbook = {
+export const NoBillingRecordPlaybook: Playbook = {
   type: PLAYBOOK_TYPE,
   detect,
   validate,
@@ -551,5 +467,4 @@ export const MissingInvoicePlaybook: Playbook = {
   execute,
 };
 
-// Named exports for direct use
 export { detect, validate, estimate, preview, execute };

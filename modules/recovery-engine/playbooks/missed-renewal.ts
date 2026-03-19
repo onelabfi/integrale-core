@@ -1,10 +1,16 @@
 /**
- * Missing Invoice Playbook
+ * Missed Renewal Playbook
  *
- * Detects CRM deals marked "Closed Won" that have no corresponding
- * invoice in Stripe, and enables safe automated recovery.
+ * Detects customers with canceled/expired subscriptions who are
+ * still active in the CRM. These are missed renewals — the customer
+ * is still engaged but their subscription lapsed.
  *
- * Production-safe: idempotent, no duplicates, fail-safe execution.
+ * Detection logic:
+ *   - Subscription status is "canceled" or "past_due"
+ *   - Customer has an active deal in CRM (lifecycle = active)
+ *   - No replacement subscription exists
+ *
+ * Production-safe: idempotent, no duplicate subscriptions, fail-safe.
  *
  * Lifecycle:
  *   detect() → validate() → estimate() → preview() → execute()
@@ -19,20 +25,21 @@ import type {
   ExecutionResult,
   DealInput,
   InvoiceInput,
+  SubscriptionInput,
 } from "../types.js";
 import * as store from "../storage/recoveryStore.js";
 
-const PLAYBOOK_TYPE: PlaybookType = "missing_invoice";
+const PLAYBOOK_TYPE: PlaybookType = "missed_renewal";
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
-/** Amount tolerance for invoice matching (±2%) */
-const AMOUNT_TOLERANCE = 0.02;
+/** Minimum days since cancellation before flagging (to avoid false positives) */
+const MIN_CANCELED_DAYS = 3;
 
-/** Minimum hours since deal close before we flag it (24h) */
-const MIN_AGE_HOURS = 24;
+/** Maximum days since cancellation (too old = probably intentional) */
+const MAX_CANCELED_DAYS = 180;
 
-/** Patterns that indicate test/internal deals (case-insensitive) */
+/** Patterns that indicate test/internal (case-insensitive) */
 const EXCLUDED_PATTERNS = [
   /\btest\b/i,
   /\binternal\b/i,
@@ -54,135 +61,136 @@ function fmtEur(amount: number): string {
   }).format(amount);
 }
 
-function hoursSince(isoDate: string): number {
-  return (Date.now() - new Date(isoDate).getTime()) / (1000 * 60 * 60);
-}
-
 function daysSince(isoDate: string): number {
-  return Math.floor(hoursSince(isoDate) / 24);
+  return Math.floor((Date.now() - new Date(isoDate).getTime()) / (1000 * 60 * 60 * 24));
 }
 
 /* ── Credit cost calculation ───────────────────────────────────────── */
 
 function calcCreditsRequired(amount: number): number {
-  if (amount > 10000) return Math.floor(amount / 100);
-  if (amount > 5000) return Math.floor(amount / 80);
-  return Math.floor(amount / 50);
+  return Math.round(amount / 100);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- * INVOICE MATCHING
- * Checks if a deal already has a corresponding Stripe invoice.
+ * ACTIVE CUSTOMER CHECK
  *
- * Match criteria (any of):
- *   1. Invoice metadata.dealId === deal.id (system-created)
- *   2. Same customer + amount within ±2% tolerance
+ * Determines if a customer is still "active" in the CRM by checking
+ * if they have a closed_won deal. This serves as a proxy for
+ * lifecycle stage when usage data isn't available.
  * ═══════════════════════════════════════════════════════════════════ */
 
-function hasMatchingInvoice(deal: DealInput, invoices: InvoiceInput[]): boolean {
-  return invoices.some((inv) => {
-    // Match by metadata (system-created invoices)
-    if (inv.metadata?.dealId === deal.id) return true;
-    if (inv.metadata?.source === "integrale_recovery" && inv.metadata?.dealId === deal.id) return true;
+function isCustomerActiveInCRM(customerId: string, deals: DealInput[]): boolean {
+  return deals.some(
+    (d) => d.customerId === customerId && d.stage === "closed_won",
+  );
+}
 
-    // Match by customer + amount within tolerance
-    if (inv.customerId !== deal.customerId) return false;
-    const amountDiff = Math.abs(inv.amount - deal.amount) / deal.amount;
-    return amountDiff <= AMOUNT_TOLERANCE;
-  });
+/* ═══════════════════════════════════════════════════════════════════
+ * DUPLICATE SUBSCRIPTION CHECK
+ *
+ * Returns true if the customer already has an active subscription,
+ * preventing double-subscribing.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+function hasActiveSubscription(customerId: string, subscriptions: SubscriptionInput[]): boolean {
+  return subscriptions.some(
+    (s) => s.customerId === customerId && s.status === "active",
+  );
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * detect()
  *
- * Returns all Closed Won deals with no matching Stripe invoice.
- * Pure function — no side effects, no mutations.
+ * Returns canceled/expired subscriptions where:
+ *   - Customer is still active in CRM
+ *   - No replacement subscription exists
+ *   - Not already recovered
+ *
+ * Pure function — no side effects.
  * ═══════════════════════════════════════════════════════════════════ */
 
-function detect(deals: DealInput[], invoices: InvoiceInput[]): RecoveryOpportunity[] {
+function detect(deals: DealInput[], invoices: InvoiceInput[], subscriptions?: SubscriptionInput[]): RecoveryOpportunity[] {
+  if (!subscriptions || subscriptions.length === 0) return [];
+
   const opportunities: RecoveryOpportunity[] = [];
 
-  const closedWon = deals.filter(
-    (d) => d.stage === "closed_won" && d.amount > 0 && d.customerEmail,
+  // Find lapsed subscriptions (canceled or past_due)
+  const lapsedSubs = subscriptions.filter(
+    (s) => (s.status === "canceled" || s.status === "past_due") && s.amount > 0 && s.customerEmail,
   );
 
-  for (const deal of closedWon) {
-    // Skip if already matched to an invoice
-    if (hasMatchingInvoice(deal, invoices)) continue;
+  for (const sub of lapsedSubs) {
+    // Skip if customer already has an active subscription (replaced)
+    if (hasActiveSubscription(sub.customerId, subscriptions)) continue;
 
-    // Skip if already successfully recovered
-    if (store.isDealHandled(deal.id)) continue;
+    // Skip if customer is NOT active in CRM (intentional churn)
+    if (!isCustomerActiveInCRM(sub.customerId, deals)) continue;
 
-    const age = daysSince(deal.closeDate);
+    // Skip if already recovered
+    const opportunityDealId = `sub-${sub.id}`;
+    if (store.isDealHandled(opportunityDealId)) continue;
+
+    // Check cancellation age
+    const cancelDate = sub.canceledAt ?? sub.currentPeriodEnd;
+    const age = daysSince(cancelDate);
+
+    if (age < MIN_CANCELED_DAYS) continue; // Too recent
+    if (age > MAX_CANCELED_DAYS) continue; // Too old
 
     opportunities.push({
-      id: `recovery-mi-${deal.id}`,
+      id: `recovery-mr-${sub.id}`,
       playbook: PLAYBOOK_TYPE,
-      dealId: deal.id,
-      customerId: deal.customerId,
-      customerEmail: deal.customerEmail,
-      company: deal.company,
-      dealName: deal.name,
-      amount: deal.amount,
-      currency: deal.currency,
-      closeDate: deal.closeDate,
-      description: `Revenue mismatch detected — "${deal.name}" closed ${age} day${age !== 1 ? "s" : ""} ago, not reflected across connected systems`,
-      confidence: "high",
-      creditsRequired: calcCreditsRequired(deal.amount),
-      source: deal.source,
+      dealId: opportunityDealId, // Use sub ID as deal ID for idempotency
+      customerId: sub.customerId,
+      customerEmail: sub.customerEmail,
+      company: sub.company,
+      dealName: sub.plan,
+      amount: sub.amount,
+      currency: sub.currency,
+      closeDate: cancelDate,
+      description: `Revenue continuity gap — "${sub.plan}" (${sub.company}) billing cycle lapsed ${age} day${age !== 1 ? "s" : ""} ago, account still active`,
+      confidence: "medium",
+      creditsRequired: calcCreditsRequired(sub.amount),
+      source: "stripe",
+      subscriptionId: sub.id,
+      planName: sub.plan,
     });
   }
 
-  // Sort by amount descending (highest value first)
+  // Sort by amount descending
   opportunities.sort((a, b) => b.amount - a.amount);
   return opportunities;
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * validate()
- *
- * Returns true only if the opportunity is safe to recover.
- * Checks: amount > 0, valid email, not test/internal, ≥24h old,
- * not previously handled.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function validate(opportunity: RecoveryOpportunity): ValidationResult {
   const reasons: string[] = [];
 
-  // Amount must be positive
   if (opportunity.amount <= 0) {
-    reasons.push("Deal amount must be greater than zero");
+    reasons.push("Subscription amount must be greater than zero");
   }
 
-  // Valid email
   if (!EMAIL_REGEX.test(opportunity.customerEmail)) {
     reasons.push(`Invalid customer email: ${opportunity.customerEmail}`);
   }
 
-  // Not test/internal
-  const dealText = `${opportunity.dealName} ${opportunity.company}`.toLowerCase();
+  const text = `${opportunity.dealName} ${opportunity.company}`.toLowerCase();
   for (const pattern of EXCLUDED_PATTERNS) {
-    if (pattern.test(dealText)) {
-      reasons.push(`Deal appears to be test/internal (matched: ${pattern.source})`);
+    if (pattern.test(text)) {
+      reasons.push(`Subscription appears to be test/internal (matched: ${pattern.source})`);
       break;
     }
   }
 
-  // Age check: if close date is in the past, must be at least 24h old.
-  // Future close dates are allowed (deal marked won with upcoming close date).
-  const ageHours = hoursSince(opportunity.closeDate);
-  if (ageHours >= 0 && ageHours < MIN_AGE_HOURS) {
-    reasons.push(`Deal closed less than 24 hours ago (${Math.round(ageHours)}h)`);
-  }
-
-  // Not already handled
   if (store.isDealHandled(opportunity.dealId)) {
-    reasons.push("This deal has already been successfully recovered");
+    reasons.push("This subscription has already been renewed");
   }
 
-  // Not currently being processed
   if (store.hasActiveAction(opportunity.id)) {
-    reasons.push("A recovery action is already in progress for this opportunity");
+    reasons.push("A renewal action is already in progress for this subscription");
   }
 
   return {
@@ -193,22 +201,18 @@ function validate(opportunity: RecoveryOpportunity): ValidationResult {
 
 /* ═══════════════════════════════════════════════════════════════════
  * estimate()
- *
- * Returns amount, confidence, and credit cost.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function estimate(opportunity: RecoveryOpportunity): EstimationResult {
   return {
     amount: opportunity.amount,
-    confidence: "high",
+    confidence: "medium",
     creditsRequired: calcCreditsRequired(opportunity.amount),
   };
 }
 
 /* ═══════════════════════════════════════════════════════════════════
  * preview() — DRY RUN
- *
- * Returns a structured action plan. Executes NOTHING.
  * ═══════════════════════════════════════════════════════════════════ */
 
 function preview(opportunity: RecoveryOpportunity): PreviewResult {
@@ -221,11 +225,11 @@ function preview(opportunity: RecoveryOpportunity): PreviewResult {
   return {
     opportunityId: opportunity.id,
     actions: [
-      `Missing revenue will be recovered and invoiced`,
+      `Missed renewal will be recovered and billing restored`,
       `All systems will be brought into alignment`,
     ],
     technicalDetails: [],
-    riskLevel: "low",
+    riskLevel: "medium",
     estimatedAmount: opportunity.amount,
     warnings,
   };
@@ -233,37 +237,17 @@ function preview(opportunity: RecoveryOpportunity): PreviewResult {
 
 /* ═══════════════════════════════════════════════════════════════════
  * execute() — SAFE EXECUTION
- *
- * Creates a Stripe invoice and updates CRM. Production-safe:
- *   - Idempotency check (no duplicate invoices)
- *   - Atomic action record (pending → success/failed)
- *   - Simulated Stripe/HubSpot calls (swap for real SDK)
- *
- * ⚠️  All execution goes through safeExecute wrapper below.
  * ═══════════════════════════════════════════════════════════════════ */
 
 async function execute(opportunity: RecoveryOpportunity): Promise<ExecutionResult> {
   return safeExecute(opportunity);
 }
 
-/**
- * safeExecute() — Production-grade execution wrapper
- *
- * Safety guarantees enforced in order:
- *   1. Rate limiting (max concurrent + per-minute)
- *   2. Idempotency (deal already recovered → no-op)
- *   3. Preview enforcement (must preview before execute)
- *   4. Execution lock (no parallel execution on same deal)
- *   5. Validation (amount, email, age, exclusions)
- *   6. Stripe duplicate check (metadata.dealId)
- *   7. Atomic action record (pending → success | failed)
- *   8. Lock release (always, even on failure)
- */
 async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionResult> {
   const executedActions: string[] = [];
   const now = new Date().toISOString();
 
-  // ── Gate 1: Rate limiting ──────────────────────────────────────
+  // ── Gate 1: Rate limiting
   const rateCheck = store.checkRateLimit();
   if (!rateCheck.allowed) {
     return {
@@ -276,7 +260,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     };
   }
 
-  // ── Gate 2: Idempotency check ──────────────────────────────────
+  // ── Gate 2: Idempotency check
   if (store.isDealHandled(opportunity.dealId)) {
     const action = store.createAction({
       playbookType: PLAYBOOK_TYPE,
@@ -288,14 +272,14 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     return {
       opportunityId: opportunity.id,
       success: false,
-      error: "Deal already recovered — invoice exists",
+      error: "Subscription already renewed — no action needed",
       errorType: "already_handled",
       executedAt: now,
-      actions: ["Idempotency check: deal already handled — no action taken"],
+      actions: ["Idempotency check: subscription already handled — no action taken"],
     };
   }
 
-  // ── Gate 3: Preview enforcement + state hash validation ────────
+  // ── Gate 3: Preview enforcement + state hash validation
   const currentHash = store.computeStateHash(opportunity);
   const previewCheck = store.validatePreviewToken(opportunity.id, currentHash);
   if (!previewCheck.valid) {
@@ -309,7 +293,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
     };
   }
 
-  // ── Gate 4: Execution lock (prevent parallel execution) ────────
+  // ── Gate 4: Execution lock
   const lockResult = store.acquireLock(opportunity.dealId, opportunity.id);
   if (!lockResult.acquired) {
     return {
@@ -323,7 +307,7 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
   }
 
   try {
-    // ── Gate 5: Validation ─────────────────────────────────────────
+    // ── Gate 5: Validation
     const validation = validate(opportunity);
     if (!validation.valid) {
       return {
@@ -336,26 +320,20 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
       };
     }
 
-    // ── Gate 6: Stripe duplicate check ─────────────────────────────
-    const duplicateCheck = await checkStripeDuplicate(opportunity.dealId);
-    if (duplicateCheck.exists) {
-      store.createAction({
-        playbookType: PLAYBOOK_TYPE,
-        dealId: opportunity.dealId,
-        opportunityId: opportunity.id,
-        metadata: { reason: "stripe_duplicate_detected", existingInvoiceId: duplicateCheck.invoiceId },
-      });
+    // ── Gate 6: Check for active subscriptions (prevent double-subscribe)
+    const activeSubs = await checkActiveSubscriptions(opportunity.customerId);
+    if (activeSubs.exists) {
       return {
         opportunityId: opportunity.id,
         success: false,
-        error: `Stripe invoice already exists for this deal (${duplicateCheck.invoiceId})`,
+        error: `Customer already has active subscription: ${activeSubs.subscriptionId}`,
         errorType: "duplicate_detected",
         executedAt: now,
-        actions: [`Stripe duplicate detected: ${duplicateCheck.invoiceId} — no action taken`],
+        actions: [`Active subscription found: ${activeSubs.subscriptionId} — no action taken`],
       };
     }
 
-    // ── Step 1: Create action record (pending) ────────────────────
+    // ── Step 1: Create action record
     const action = store.createAction({
       playbookType: PLAYBOOK_TYPE,
       dealId: opportunity.dealId,
@@ -364,43 +342,44 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
         company: opportunity.company,
         amount: opportunity.amount,
         customerEmail: opportunity.customerEmail,
+        subscriptionId: opportunity.subscriptionId,
+        planName: opportunity.planName,
         previewedAt: "yes",
         stateHash: currentHash,
       },
     });
 
-    // Track structured counts for summary
-    let invoicesCreated = 0;
-    let dealsUpdated = 0;
+    let subscriptionsCreated = 0;
 
     try {
-      // ── Step 2: Ensure Stripe customer exists ───────────────────
-      const customerId = await ensureStripeCustomer(opportunity);
-      executedActions.push(`Verified Stripe customer: ${customerId}`);
+      // ── Step 2: Retrieve previous subscription plan
+      const previousPlan = await getPreviousSubscription(opportunity.subscriptionId!);
+      executedActions.push(`Retrieved previous subscription plan: ${previousPlan.plan}`);
 
-      // ── Step 3: Create Stripe invoice ───────────────────────────
-      const invoiceId = await createStripeInvoice({
-        customerId,
+      // ── Step 3: Create new subscription
+      const newSubId = await createSubscription({
+        customerId: opportunity.customerId,
+        plan: previousPlan.plan,
         amount: opportunity.amount,
         currency: opportunity.currency,
-        dealId: opportunity.dealId,
+        previousSubscriptionId: opportunity.subscriptionId!,
       });
-      executedActions.push(`Created Stripe invoice: ${invoiceId} for ${fmtEur(opportunity.amount)}`);
-      invoicesCreated++;
+      executedActions.push(`Created new subscription: ${newSubId} (${opportunity.planName} at ${fmtEur(opportunity.amount)})`);
+      subscriptionsCreated++;
 
-      // ── Step 4: Update CRM deal ─────────────────────────────────
-      await updateHubSpotDeal(opportunity.dealId, {
-        invoiced: true,
-        invoiceId,
-        invoiceCreatedAt: now,
+      // ── Step 4: Update CRM
+      await updateCRMRenewal(opportunity.customerId, {
+        renewed: true,
+        newSubscriptionId: newSubId,
+        renewedAt: now,
+        planName: opportunity.planName,
       });
-      executedActions.push(`Updated CRM deal ${opportunity.dealId}: invoiced=true`);
-      dealsUpdated++;
+      executedActions.push(`Updated CRM: renewal recorded for ${opportunity.company}`);
 
-      // ── Step 5: Mark action as success + consume preview ────────
+      // ── Step 5: Mark success + consume preview
       store.updateAction(action.id, {
         status: "success",
-        metadata: { invoiceId, completedActions: executedActions },
+        metadata: { newSubscriptionId: newSubId, completedActions: executedActions },
       });
       store.consumePreviewToken(opportunity.id);
       executedActions.push(`Logged recovery action: ${action.id}`);
@@ -408,13 +387,13 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
       return {
         opportunityId: opportunity.id,
         success: true,
-        invoiceId,
+        invoiceId: newSubId, // Reuse field for subscription ID
         executedAt: now,
         actions: executedActions,
         summary: {
-          invoicesCreated,
-          subscriptionsCreated: 0,
-          dealsUpdated,
+          invoicesCreated: 0,
+          subscriptionsCreated,
+          dealsUpdated: 1,
           actions: executedActions,
         },
       };
@@ -424,7 +403,6 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
         status: "failed",
         metadata: { error: errorMsg, completedActions: executedActions },
       });
-
       return {
         opportunityId: opportunity.id,
         success: false,
@@ -442,98 +420,56 @@ async function safeExecute(opportunity: RecoveryOpportunity): Promise<ExecutionR
 /* ═══════════════════════════════════════════════════════════════════
  * SIMULATED EXTERNAL CALLS
  *
- * These simulate Stripe and HubSpot API calls.
- * In production, replace with real SDK calls:
- *   - stripe.customers.create() / stripe.invoices.create()
- *   - hubspot.crm.deals.basicApi.update()
+ * In production, replace with real Stripe SDK calls.
  * ═══════════════════════════════════════════════════════════════════ */
 
-let invoiceCounter = 1000;
+let subscriptionCounter = 500;
 
-/**
- * Check Stripe for existing invoices with matching dealId metadata.
- * Prevents creating duplicate invoices even if our store was reset.
- *
- * In production: stripe.invoices.list({ metadata: { dealId } })
- */
-async function checkStripeDuplicate(dealId: string): Promise<{ exists: boolean; invoiceId?: string }> {
-  // Simulate Stripe metadata lookup
+async function checkActiveSubscriptions(customerId: string): Promise<{ exists: boolean; subscriptionId?: string }> {
   await new Promise((r) => setTimeout(r, 50));
-
-  // In production:
-  // const existing = await stripe.invoices.list({
-  //   limit: 1,
-  //   metadata: { dealId, source: "integrale_recovery" },
-  // });
-  // if (existing.data.length > 0) {
-  //   return { exists: true, invoiceId: existing.data[0].id };
-  // }
-
-  // Simulated: check our local counter-based IDs (no duplicates in simulation)
+  // In production: stripe.subscriptions.list({ customer: customerId, status: "active", limit: 1 })
   return { exists: false };
 }
 
-async function ensureStripeCustomer(opportunity: RecoveryOpportunity): Promise<string> {
-  // Simulate: check if customer exists, create if not
-  await new Promise((r) => setTimeout(r, 150));
-  // In production: stripe.customers.list({ email }) or stripe.customers.create()
-  return opportunity.customerId || `cus_${opportunity.customerEmail.replace(/[^a-z0-9]/gi, "")}`;
+async function getPreviousSubscription(subscriptionId: string): Promise<{ plan: string; priceId: string }> {
+  await new Promise((r) => setTimeout(r, 100));
+  // In production: stripe.subscriptions.retrieve(subscriptionId)
+  return { plan: subscriptionId, priceId: `price_${subscriptionId}` };
 }
 
-async function createStripeInvoice(params: {
+async function createSubscription(params: {
   customerId: string;
+  plan: string;
   amount: number;
   currency: string;
-  dealId: string;
+  previousSubscriptionId: string;
 }): Promise<string> {
-  // Simulate Stripe invoice creation
   await new Promise((r) => setTimeout(r, 300));
-
-  const invoiceId = `inv_integrale_${++invoiceCounter}`;
+  const subId = `sub_integrale_${++subscriptionCounter}`;
 
   // In production:
-  // const invoice = await stripe.invoices.create({
+  // const subscription = await stripe.subscriptions.create({
   //   customer: params.customerId,
-  //   collection_method: "send_invoice",
-  //   days_until_due: 30,
+  //   items: [{ price: params.priceId }],
   //   metadata: {
-  //     dealId: params.dealId,
   //     source: "integrale_recovery",
+  //     previousSubscriptionId: params.previousSubscriptionId,
   //   },
   // });
-  // await stripe.invoiceItems.create({
-  //   customer: params.customerId,
-  //   invoice: invoice.id,
-  //   amount: params.amount * 100, // cents
-  //   currency: params.currency.toLowerCase(),
-  // });
-  // await stripe.invoices.finalizeInvoice(invoice.id);
 
   console.log(
-    `[Recovery] Created invoice ${invoiceId}: ${params.amount} ${params.currency} for customer ${params.customerId} (deal: ${params.dealId})`,
+    `[Recovery:MR] Created subscription ${subId}: ${params.plan} at ${params.amount} ${params.currency} for customer ${params.customerId}`,
   );
-
-  return invoiceId;
+  return subId;
 }
 
-async function updateHubSpotDeal(
-  dealId: string,
+async function updateCRMRenewal(
+  customerId: string,
   properties: Record<string, unknown>,
 ): Promise<void> {
-  // Simulate HubSpot deal update
   await new Promise((r) => setTimeout(r, 150));
-
-  // In production:
-  // await hubspotClient.crm.deals.basicApi.update(dealId, {
-  //   properties: {
-  //     invoiced: "true",
-  //     invoice_id: properties.invoiceId,
-  //     invoice_created_at: properties.invoiceCreatedAt,
-  //   },
-  // });
-
   console.log(
-    `[Recovery] Updated HubSpot deal ${dealId}:`,
+    `[Recovery:MR] Updated CRM for customer ${customerId}:`,
     JSON.stringify(properties),
   );
 }
@@ -542,7 +478,7 @@ async function updateHubSpotDeal(
  * EXPORT — Playbook interface
  * ═══════════════════════════════════════════════════════════════════ */
 
-export const MissingInvoicePlaybook: Playbook = {
+export const MissedRenewalPlaybook: Playbook = {
   type: PLAYBOOK_TYPE,
   detect,
   validate,
@@ -551,5 +487,4 @@ export const MissingInvoicePlaybook: Playbook = {
   execute,
 };
 
-// Named exports for direct use
 export { detect, validate, estimate, preview, execute };

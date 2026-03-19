@@ -39,32 +39,35 @@ function hasRenewal(sub: Subscription, deals: Deal[], subs: Subscription[]): boo
 
 /* ── AI-generated fix suggestions per category ───────────────────── */
 
+function crmLabel(deal: Deal): string {
+  return deal.source === "salesforce" ? "Salesforce" : "HubSpot";
+}
+
 function getFixForUninvoiced(deal: Deal): LeakFix {
-  const days = daysSince(deal.close_date);
   return {
-    cause: `When "${deal.name}" was marked as Closed Won in HubSpot ${days} days ago, no automation triggered invoice creation in Stripe. The deal and billing systems are not connected.`,
-    trigger: "Deal marked as Closed Won in HubSpot",
-    action: `Create a ${fmtEur(deal.amount)} invoice in Stripe for ${deal.company} within 24 hours of deal close`,
-    impact: `Recovers ${fmtEur(deal.amount)} for this deal. Prevents future uninvoiced deals automatically.`,
+    cause: `Revenue from "${deal.name}" (${deal.company}) was not recorded across connected systems after deal close. Systems are out of alignment.`,
+    trigger: "Detected automatically",
+    action: `Recover ${fmtEur(deal.amount)} and bring all systems into alignment`,
+    impact: `Recovers ${fmtEur(deal.amount)} for this deal. Prevents future misalignment automatically.`,
   };
 }
 
 function getFixForRenewal(sub: Subscription): LeakFix {
   const days = daysSince(sub.current_period_end);
   return {
-    cause: `The "${sub.plan}" subscription for ${sub.company} expired ${days} days ago. No renewal workflow exists — the team was never notified, and no follow-up deal was created.`,
-    trigger: "Subscription reaches 30 days before expiry",
-    action: `Send renewal reminder to ${sub.company}, create renewal deal in HubSpot, and auto-generate renewal quote`,
-    impact: `Recovers ${fmtEur(sub.amount)} in recurring revenue. Prevents silent churn on all future renewals.`,
+    cause: `Revenue continuity gap detected for ${sub.company} — billing cycle lapsed ${days} days ago while account remains active.`,
+    trigger: "Detected automatically",
+    action: `Restore billing continuity for ${sub.company} and recover ${fmtEur(sub.amount)}`,
+    impact: `Recovers ${fmtEur(sub.amount)} in recurring revenue. Prevents future continuity gaps automatically.`,
   };
 }
 
 function getFixForChurn(sub: Subscription): LeakFix {
   return {
-    cause: `${sub.company} has a ${sub.status === "past_due" ? "past due" : "overdue"} subscription with no recent payment activity. Without intervention, this customer will likely churn.`,
-    trigger: "Payment fails or subscription becomes past due",
-    action: `Send automated dunning email to ${sub.company}, notify account manager, and retry payment in 48 hours`,
-    impact: `Saves ${fmtEur(sub.amount)} in at-risk revenue. Reduces involuntary churn by catching payment issues early.`,
+    cause: `Revenue at risk for ${sub.company} — billing disruption detected across connected systems.`,
+    trigger: "Detected automatically",
+    action: `Secure ${fmtEur(sub.amount)} in at-risk revenue and restore system alignment`,
+    impact: `Protects ${fmtEur(sub.amount)} in at-risk revenue. Prevents future disruptions automatically.`,
   };
 }
 
@@ -88,8 +91,8 @@ export function detectLeaks(
         amount: deal.amount,
         currency: deal.currency,
         date: deal.close_date,
-        issue: `${fmtEur(deal.amount)} not invoiced`,
-        detail: `"${deal.name}" closed ${daysClosed} day${daysClosed !== 1 ? "s" : ""} ago with no matching Stripe invoice. ${fmtEur(deal.amount)} is sitting in your CRM but not in your billing system.`,
+        issue: `${fmtEur(deal.amount)} revenue mismatch`,
+        detail: `"${deal.name}" closed ${daysClosed} day${daysClosed !== 1 ? "s" : ""} ago — revenue not recorded across connected systems. ${fmtEur(deal.amount)} detected as unrecovered.`,
         source_record_id: deal.id,
         status: "open",
         fix: getFixForUninvoiced(deal),
@@ -112,8 +115,8 @@ export function detectLeaks(
         amount: sub.amount,
         currency: sub.currency,
         date: sub.current_period_end,
-        issue: `${fmtEur(sub.amount)} renewal missed`,
-        detail: `"${sub.plan}" for ${sub.company} expired ${daysExpired} day${daysExpired !== 1 ? "s" : ""} ago. Nobody followed up — ${fmtEur(sub.amount)} in recurring revenue silently disappeared.`,
+        issue: `${fmtEur(sub.amount)} revenue continuity gap`,
+        detail: `"${sub.plan}" for ${sub.company} — billing cycle lapsed ${daysExpired} day${daysExpired !== 1 ? "s" : ""} ago while account remains active. ${fmtEur(sub.amount)} in recurring revenue not captured.`,
         source_record_id: sub.id,
         status: "open",
         fix: getFixForRenewal(sub),
@@ -142,8 +145,8 @@ export function detectLeaks(
       amount: sub.amount,
       currency: sub.currency,
       date: sub.current_period_end,
-      issue: `${fmtEur(sub.amount)} at risk of churn`,
-      detail: `${sub.company} subscription "${sub.plan}" is ${sub.status === "past_due" ? "past due" : "overdue"}. No payment activity detected. ${fmtEur(sub.amount)} will be lost without intervention.`,
+      issue: `${fmtEur(sub.amount)} revenue at risk`,
+      detail: `${sub.company} — billing disruption detected across connected systems. ${fmtEur(sub.amount)} at risk without automated intervention.`,
       source_record_id: sub.id,
       status: "open",
       fix: getFixForChurn(sub),
@@ -192,17 +195,17 @@ export function generateLeakSummary(output: DetectionOutput): string {
 
   if (summary.uninvoiced_count > 0) {
     parts.push(
-      `${summary.uninvoiced_count} closed deal${summary.uninvoiced_count > 1 ? "s have" : " has"} no matching invoice — ${fmt(summary.uninvoiced_total)} in unrecovered revenue`,
+      `${summary.uninvoiced_count} revenue mismatch${summary.uninvoiced_count > 1 ? "es" : ""} detected — ${fmt(summary.uninvoiced_total)} not recorded across systems`,
     );
   }
   if (summary.missing_renewal_count > 0) {
     parts.push(
-      `${summary.missing_renewal_count} subscription${summary.missing_renewal_count > 1 ? "s" : ""} expired without renewal — ${fmt(summary.missing_renewal_total)} in recurring revenue lost`,
+      `${summary.missing_renewal_count} revenue continuity gap${summary.missing_renewal_count > 1 ? "s" : ""} detected — ${fmt(summary.missing_renewal_total)} in recurring revenue not captured`,
     );
   }
   if (summary.churn_risk_count > 0) {
     parts.push(
-      `${summary.churn_risk_count} customer${summary.churn_risk_count > 1 ? "s show" : " shows"} churn signals — ${fmt(summary.churn_risk_total)} at risk`,
+      `${summary.churn_risk_count} billing disruption${summary.churn_risk_count > 1 ? "s" : ""} detected — ${fmt(summary.churn_risk_total)} at risk`,
     );
   }
 
@@ -227,14 +230,14 @@ export function generateRootCause(output: DetectionOutput): { rootCause: string;
   let recommendation: string;
 
   if (uninvPct >= renewPct && uninvPct > 30) {
-    rootCause = `${uninvPct}% of your revenue leaks are caused by missing automation between your CRM and billing system. Deals close in HubSpot but invoices never get created in Stripe.`;
-    recommendation = "Connect deal close events to automatic invoice creation. This single automation would prevent the majority of your leakage.";
+    rootCause = `${uninvPct}% of detected issues stem from revenue not being recorded across connected systems after deal close. Systems are out of alignment.`;
+    recommendation = "Automated system alignment will prevent the majority of future revenue mismatches.";
   } else if (renewPct > uninvPct) {
-    rootCause = `${renewPct}% of your revenue leaks come from subscriptions expiring without follow-up. Your team has no automated renewal workflow — customers silently churn.`;
-    recommendation = "Set up renewal reminders 30 days before expiry and auto-create renewal deals. This closes the gap between subscription end and re-engagement.";
+    rootCause = `${renewPct}% of detected issues are revenue continuity gaps — billing cycles lapsing while accounts remain active across systems.`;
+    recommendation = "Automated continuity monitoring will detect and resolve future gaps before revenue is lost.";
   } else {
-    rootCause = "Your revenue leaks are spread across invoicing gaps, missed renewals, and churn signals. The common thread: no automation connects your CRM to your billing system.";
-    recommendation = "Activate end-to-end automation between HubSpot and Stripe. One integration prevents multiple categories of leakage.";
+    rootCause = "Revenue leaks are distributed across system misalignments, continuity gaps, and billing disruptions. The common thread: systems operating independently without automated coordination.";
+    recommendation = "End-to-end system alignment will prevent multiple categories of revenue leakage simultaneously.";
   }
 
   return { rootCause, recommendation };

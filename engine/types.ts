@@ -5,6 +5,8 @@ export type ConnectorStatus = "disconnected" | "connecting" | "connected" | "err
 export interface ConnectorState {
   hubspot: ConnectorStatus;
   stripe: ConnectorStatus;
+  salesforce: ConnectorStatus;
+  sap: ConnectorStatus;
 }
 
 /* ── Normalized data models ──────────────────────────────────────── */
@@ -13,7 +15,7 @@ export interface Customer {
   id: string;
   name: string;
   email: string;
-  source: "hubspot" | "stripe" | "both";
+  source: "hubspot" | "stripe" | "salesforce" | "sap" | "both";
 }
 
 export interface Deal {
@@ -25,7 +27,8 @@ export interface Deal {
   currency: string;
   stage: "closed_won" | "open" | "lost";
   close_date: string;
-  source: "hubspot";
+  source: "hubspot" | "salesforce";
+  contact_email?: string;
 }
 
 export interface Invoice {
@@ -51,6 +54,17 @@ export interface Subscription {
   current_period_end: string;
   canceled_at: string | null;
   source: "stripe";
+}
+
+export interface BusinessPartner {
+  id: string;
+  name: string;
+  category: string;
+  type: string;
+  firstName: string | null;
+  lastName: string | null;
+  industry: string | null;
+  source: "sap";
 }
 
 /* ── Detection results ───────────────────────────────────────────── */

@@ -30,7 +30,7 @@ import { HubSpotConnector } from "../connectors/hubspot.js";
 import { StripeConnector } from "../connectors/stripe.js";
 import { SalesforceConnector } from "../connectors/salesforce.js";
 import { SAPConnector } from "../connectors/sap.js";
-import { detectLeaks, generateLeakSummary, generateRootCause } from "../engine/detectionEngine.js";
+import { detectLeaks, generateLeakSummary, generateRootCause, deduplicateDeals } from "../engine/detectionEngine.js";
 import { MOCK_DEALS, MOCK_INVOICES, MOCK_SUBSCRIPTIONS, MOCK_CUSTOMERS } from "../engine/mockData.js";
 import { WorkflowEngine } from "../workflows/workflowEngine.js";
 import { RecoveryEngine, DEFAULT_AUTO_RECOVERY_CONFIG } from "../modules/recovery-engine/index.js";
@@ -281,7 +281,7 @@ app.post("/api/scan/legacy", async (_req, res) => {
       stripe.getSubscriptions().catch(() => MOCK_SUBSCRIPTIONS),
     ]);
 
-    const deals = [...hubspotDeals, ...salesforceDeals];
+    const deals = deduplicateDeals(hubspotDeals, salesforceDeals);
 
     scanResult = detectLeaks(deals, invoices, subscriptions);
     leaks = scanResult.leaks;
@@ -427,7 +427,7 @@ app.get("/api/recovery/scan", async (_req, res) => {
     ]);
 
     // Merge deals from both CRMs
-    const deals = [...hubspotDeals, ...salesforceDeals];
+    const deals = deduplicateDeals(hubspotDeals, salesforceDeals);
 
     // Build customer email map from live deal data (supplements mock customer map)
     for (const deal of deals) {

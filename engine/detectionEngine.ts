@@ -10,6 +10,44 @@ import type { Deal, Invoice, Subscription, RevenueLeak, LeakSummary, DetectionOu
 
 const INVOICE_MATCH_WINDOW_DAYS = 30;
 
+/**
+ * Deduplicate deals that exist in multiple CRM systems.
+ * Matches on: company name (case-insensitive) + amount within 5% + close date within 7 days.
+ * When a match is found, keeps the first occurrence.
+ */
+export function deduplicateDeals(...dealSets: Deal[][]): Deal[] {
+  const result: Deal[] = [];
+  const AMOUNT_THRESHOLD = 0.05;
+  const DATE_WINDOW_MS = 7 * 86_400_000;
+
+  for (const dealSet of dealSets) {
+    for (const deal of dealSet) {
+      const isDuplicate = result.some((existing) => {
+        const sameCompany =
+          !!existing.company &&
+          !!deal.company &&
+          existing.company.toLowerCase().trim() === deal.company.toLowerCase().trim();
+
+        const amountDiff = Math.abs(existing.amount - deal.amount);
+        const maxAmount = Math.max(existing.amount, deal.amount);
+        const sameAmount = maxAmount > 0 ? amountDiff / maxAmount < AMOUNT_THRESHOLD : true;
+
+        const existDate = new Date(existing.close_date).getTime();
+        const dealDate = new Date(deal.close_date).getTime();
+        const sameDate = Math.abs(existDate - dealDate) <= DATE_WINDOW_MS;
+
+        return sameCompany && sameAmount && sameDate;
+      });
+
+      if (!isDuplicate) {
+        result.push(deal);
+      }
+    }
+  }
+
+  return result;
+}
+
 function daysSince(iso: string): number {
   return Math.floor((Date.now() - new Date(iso).getTime()) / 86_400_000);
 }

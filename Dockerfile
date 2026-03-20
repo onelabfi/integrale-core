@@ -2,13 +2,16 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Install dependencies first (layer caching)
+# Install ALL dependencies (including devDeps for TypeScript build)
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+RUN npm ci
 
 # Copy source and build
 COPY . .
 RUN npm run build
+
+# Remove devDependencies after build to slim down image
+RUN npm prune --omit=dev
 
 EXPOSE 3001
 

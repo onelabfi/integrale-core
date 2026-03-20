@@ -13,7 +13,7 @@ import {
   generateLeakSummary,
   generateRootCause,
 } from "../engine/detectionEngine.js";
-import type { RevenueLeak, DetectionOutput } from "../engine/types.js";
+import type { RevenueLeak, DetectionOutput, Deal } from "../engine/types.js";
 import { HubSpotConnector } from "../connectors/hubspot.js";
 import { StripeConnector } from "../connectors/stripe.js";
 import { SalesforceConnector } from "../connectors/salesforce.js";
@@ -137,6 +137,46 @@ const DEMO_FINDINGS: Omit<Finding, "id" | "org_id" | "scan_id" | "created_at" | 
   },
 ];
 
+/* ── Deal deduplication across CRM systems ───────────────────────────── */
+
+/**
+ * Deduplicate deals that exist in both HubSpot and Salesforce.
+ * Matches on: company name (case-insensitive) + amount within 5% + close date within 7 days.
+ * When a match is found, keeps the HubSpot version (first source).
+ */
+function deduplicateDeals(hubspotDeals: Deal[], salesforceDeals: Deal[]): Deal[] {
+  const result = [...hubspotDeals];
+  const AMOUNT_THRESHOLD = 0.05; // 5%
+  const DATE_WINDOW_MS = 7 * 86_400_000; // 7 days
+
+  for (const sfDeal of salesforceDeals) {
+    const isDuplicate = result.some((hsDeal) => {
+      // Compare company names (case-insensitive, trimmed)
+      const sameCompany =
+        hsDeal.company?.toLowerCase().trim() === sfDeal.company?.toLowerCase().trim() &&
+        !!hsDeal.company;
+
+      // Compare amounts within threshold
+      const amountDiff = Math.abs(hsDeal.amount - sfDeal.amount);
+      const maxAmount = Math.max(hsDeal.amount, sfDeal.amount);
+      const sameAmount = maxAmount > 0 ? amountDiff / maxAmount < AMOUNT_THRESHOLD : true;
+
+      // Compare close dates within window
+      const hsDate = new Date(hsDeal.close_date).getTime();
+      const sfDate = new Date(sfDeal.close_date).getTime();
+      const sameDate = Math.abs(hsDate - sfDate) <= DATE_WINDOW_MS;
+
+      return sameCompany && sameAmount && sameDate;
+    });
+
+    if (!isDuplicate) {
+      result.push(sfDeal);
+    }
+  }
+
+  return result;
+}
+
 /* ── Service ─────────────────────────────────────────────────────────── */
 
 /**
@@ -219,7 +259,8 @@ async function executeScan(orgId: string, scanId: string): Promise<void> {
     stripe.getSubscriptions().catch(() => MOCK_SUBSCRIPTIONS),
   ]);
 
-  const deals = [...hubspotDeals, ...salesforceDeals];
+  // Deduplicate deals across systems (same company + similar amount + close date)
+  const deals = deduplicateDeals(hubspotDeals, salesforceDeals);
 
   // ── 2. Run detection engine ──────────────────────────────────────
   const result: DetectionOutput = detectLeaks(deals, invoices, subscriptions);

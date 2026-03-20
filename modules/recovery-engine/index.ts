@@ -125,6 +125,14 @@ export class RecoveryEngine {
       this.opportunities.push(...detected);
     }
 
+    // Deduplicate: if multiple playbooks detect the same deal, keep the first one
+    const seenDeals = new Set<string>();
+    this.opportunities = this.opportunities.filter((opp) => {
+      if (seenDeals.has(opp.dealId)) return false;
+      seenDeals.add(opp.dealId);
+      return true;
+    });
+
     // Filter out deals that have already been successfully recovered
     this.opportunities = this.opportunities.filter(
       (opp) => !store.isDealHandled(opp.dealId),

@@ -38,6 +38,8 @@ import type { SafetyEnvelope, AutoRecoveryConfig } from "../modules/recovery-eng
 import type { RevenueLeak, DetectionOutput, ConnectorState, LeakSummary, LeakCategory } from "../engine/types.js";
 import * as tokenEngine from "../modules/token-engine/index.js";
 import * as pdfGenerator from "../modules/pdf-generator/index.js";
+import { authMiddleware } from "../middleware/authMiddleware.js";
+import * as findingsService from "../services/findingsService.js";
 
 const app = express();
 
@@ -81,7 +83,18 @@ function buildIssuesResponse(currentLeaks: RevenueLeak[]) {
     fixedTotal: currentLeaks.filter((l) => l.status === "fixed").reduce((s, l) => s + l.amount, 0),
   };
 }
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://integrale-app.vercel.app",
+      /\.vercel\.app$/,
+      "http://localhost:5173",
+      "http://localhost:5175",
+      "http://localhost:8080",
+    ],
+    credentials: true,
+  }),
+);
 app.use(express.json());
 
 // ── State ──────────────────────────────────────────────────────────
@@ -161,6 +174,14 @@ app.post("/api/connectors/:name/connect", async (req, res) => {
       salesforce: () => salesforce.isLive(),
       sap: () => sap.isLive(),
     };
+
+    // Auto-scan after successful connection (fire-and-forget)
+    if (orgId) {
+      findingsService.runScan(orgId).catch((err) => {
+        console.warn(`[auto-scan] Post-connect scan failed:`, err);
+      });
+    }
+
     res.json({
       status: "connected",
       live: liveMap[name]?.() ?? false,
@@ -188,10 +209,71 @@ app.post("/api/connectors/:name/disconnect", (req, res) => {
   res.json({ status: "disconnected" });
 });
 
-// ── POST /api/scan ─────────────────────────────────────────────────
-app.post("/api/scan", async (_req, res) => {
+// ── POST /api/scan (unified — async, returns scanId) ──────────────
+app.post("/api/scan", authMiddleware, async (req, res) => {
   try {
-    // Fetch deals from all connected CRMs in parallel
+    const result = await findingsService.runScan(req.orgId!);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── GET /api/findings ─────────────────────────────────────────────
+app.get("/api/findings", authMiddleware, async (req, res) => {
+  try {
+    const filters: findingsService.FindingsFilters = {};
+    if (req.query.status) filters.status = req.query.status as string;
+    if (req.query.category) filters.category = req.query.category as string;
+    const findings = await findingsService.getFindings(req.orgId!, filters);
+    res.json({ findings });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── GET /api/summary ──────────────────────────────────────────────
+app.get("/api/summary", authMiddleware, async (req, res) => {
+  try {
+    const summary = await findingsService.getSummary(req.orgId!);
+    res.json(summary);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── GET /api/scan/status ──────────────────────────────────────────
+app.get("/api/scan/status", authMiddleware, async (req, res) => {
+  try {
+    const status = await findingsService.getScanStatus(req.orgId!);
+    res.json(status);
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── PATCH /api/findings/:id ───────────────────────────────────────
+app.patch("/api/findings/:id", authMiddleware, async (req, res) => {
+  try {
+    const { status } = req.body;
+    if (!status || !["open", "fixing", "fixed", "ignored"].includes(status)) {
+      res.status(400).json({ error: "Invalid status. Must be: open, fixing, fixed, ignored" });
+      return;
+    }
+    const finding = await findingsService.updateFinding(req.orgId!, req.params.id, status);
+    if (!finding) {
+      res.status(404).json({ error: "Finding not found" });
+      return;
+    }
+    res.json({ finding });
+  } catch (err) {
+    res.status(500).json({ error: String(err) });
+  }
+});
+
+// ── POST /api/scan/legacy (backwards compat — full response) ──────
+app.post("/api/scan/legacy", async (_req, res) => {
+  try {
     const [hubspotDeals, salesforceDeals, invoices, subscriptions] = await Promise.all([
       hubspot.getDeals().catch(() => MOCK_DEALS),
       salesforce.isConnected() ? salesforce.getDeals().catch(() => []) : Promise.resolve([]),
@@ -199,52 +281,11 @@ app.post("/api/scan", async (_req, res) => {
       stripe.getSubscriptions().catch(() => MOCK_SUBSCRIPTIONS),
     ]);
 
-    // Merge deals from both CRMs
     const deals = [...hubspotDeals, ...salesforceDeals];
-    const totalRecords = deals.length + invoices.length + subscriptions.length;
 
-    // Track scan cost via token engine (internal only — not exposed to user)
-    const tokenResult = await tokenEngine.runWithTokens(
-      {
-        actionType: "initial_scan",
-        recordCount: totalRecords,
-        metadata: {
-          integration: "multi",
-          dealCount: deals.length,
-          invoiceCount: invoices.length,
-          subscriptionCount: subscriptions.length,
-        },
-      },
-      async () => {
-        const result = detectLeaks(deals, invoices, subscriptions);
-        return result;
-      }
-    );
-
-    if (tokenResult.blocked) {
-      console.warn(`[TokenEngine] Scan blocked: ${tokenResult.blockReason}`);
-      // Proceed anyway — tokens are internal, never block user-facing actions
-    }
-
-    scanResult = tokenResult.data ?? detectLeaks(deals, invoices, subscriptions);
+    scanResult = detectLeaks(deals, invoices, subscriptions);
     leaks = scanResult.leaks;
     lastScan = new Date().toISOString();
-
-    // Log leak detection tokens separately
-    if (scanResult.leaks.length > 0) {
-      tokenEngine.logUsage({
-        workspaceId: "default",
-        actionType: "leak_detection",
-        tokensEstimated: 200 + scanResult.leaks.length * 2,
-        tokensUsed: 200 + scanResult.leaks.length * 2,
-        recordsProcessed: totalRecords,
-        issuesFound: scanResult.leaks.length,
-        metadata: { leakCategories: scanResult.summary },
-        timestamp: new Date().toISOString(),
-        durationMs: 0,
-        success: true,
-      });
-    }
 
     const aiSummary = generateLeakSummary(scanResult);
     const { rootCause, recommendation } = generateRootCause(scanResult);

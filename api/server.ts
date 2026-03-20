@@ -41,6 +41,14 @@ import * as pdfGenerator from "../modules/pdf-generator/index.js";
 
 const app = express();
 
+// Base URL for OAuth callbacks — uses PUBLIC_URL env var in production, falls back to localhost
+const BASE_URL = process.env.PUBLIC_URL || `http://localhost:${process.env.PORT || 3001}`;
+
+// ── Health check (Railway / load balancer) ──────────────────────────
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
 /* ── Computed state helpers ─────────────────────────────────────────
  * All aggregation and business logic lives here in the core.
  * The frontend receives ready-to-display data.
@@ -807,7 +815,7 @@ app.get("/api/hubspot/auth-url", (_req, res) => {
     return;
   }
 
-  const redirectUri = "http://localhost:3001/api/hubspot/callback";
+  const redirectUri = `${BASE_URL}/api/hubspot/callback`;
   const scopes = ["oauth", "crm.objects.companies.read", "crm.objects.deals.read", "crm.objects.contacts.read"];
 
   const url = new URL("https://app-eu1.hubspot.com/oauth/authorize");
@@ -836,7 +844,7 @@ app.get("/api/hubspot/callback", async (req, res) => {
 
   const clientId = process.env.HUBSPOT_CLIENT_ID!;
   const clientSecret = process.env.HUBSPOT_CLIENT_SECRET!;
-  const redirectUri = "http://localhost:3001/api/hubspot/callback";
+  const redirectUri = `${BASE_URL}/api/hubspot/callback`;
   const orgId = process.env.DEFAULT_ORG_ID!;
 
   try {
@@ -948,7 +956,7 @@ app.get("/api/salesforce/auth-url", (_req, res) => {
     return;
   }
 
-  const redirectUri = "http://localhost:3001/api/salesforce/callback";
+  const redirectUri = `${BASE_URL}/api/salesforce/callback`;
   const scopes = ["api", "refresh_token", "offline_access"];
 
   // Generate PKCE code_verifier (43–128 chars, URL-safe)
@@ -988,7 +996,7 @@ app.get("/api/salesforce/callback", async (req, res) => {
 
   const clientId = process.env.SALESFORCE_CLIENT_ID!;
   const clientSecret = process.env.SALESFORCE_CLIENT_SECRET!;
-  const redirectUri = "http://localhost:3001/api/salesforce/callback";
+  const redirectUri = `${BASE_URL}/api/salesforce/callback`;
   const orgId = process.env.DEFAULT_ORG_ID!;
 
   try {
@@ -1225,6 +1233,7 @@ app.get("/api/reports/recovery/:recoveryId", (req, res) => {
 
 // ── Start ──────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`Integrale Core API running on http://localhost:${PORT}`);
+app.listen(Number(PORT), "0.0.0.0", () => {
+  console.log(`Integrale Core API running on port ${PORT}`);
+  console.log(`Public URL: ${BASE_URL}`);
 });

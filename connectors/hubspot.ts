@@ -71,7 +71,7 @@ export class HubSpotConnector {
       } else if (resp.status === 401) {
         // Token invalid, try refresh
         invalidateCache();
-        const refreshedToken = await getHubSpotToken(this.orgId);
+        const refreshedToken = await getHubSpotToken(this.orgId!);
         if (refreshedToken) {
           this.accessToken = refreshedToken;
           this.connected = true;

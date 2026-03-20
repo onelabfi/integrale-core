@@ -274,6 +274,12 @@ app.patch("/api/findings/:id", authMiddleware, async (req, res) => {
 // ── POST /api/scan/legacy (backwards compat — full response) ──────
 app.post("/api/scan/legacy", async (_req, res) => {
   try {
+    // Ensure connectors are initialized
+    const orgId = process.env.DEFAULT_ORG_ID;
+    if (!hubspot.isConnected()) await hubspot.connect({ orgId }).catch(() => {});
+    if (!stripe.isConnected()) await stripe.connect({ apiKey: process.env.STRIPE_SECRET_KEY }).catch(() => {});
+    if (!salesforce.isConnected()) await salesforce.connect({ orgId }).catch(() => {});
+
     const [hubspotDeals, salesforceDeals, invoices, subscriptions] = await Promise.all([
       hubspot.getDeals().catch(() => MOCK_DEALS),
       salesforce.isConnected() ? salesforce.getDeals().catch(() => []) : Promise.resolve([]),
@@ -418,6 +424,12 @@ app.get("/api/workflows", (_req, res) => {
 // Each opportunity includes: id, amount, description, confidence, creditsRequired, safety status
 app.get("/api/recovery/scan", async (_req, res) => {
   try {
+    // Ensure connectors are initialized (loads OAuth tokens from DB)
+    const orgId = process.env.DEFAULT_ORG_ID;
+    if (!hubspot.isConnected()) await hubspot.connect({ orgId }).catch(() => {});
+    if (!stripe.isConnected()) await stripe.connect({ apiKey: process.env.STRIPE_SECRET_KEY }).catch(() => {});
+    if (!salesforce.isConnected()) await salesforce.connect({ orgId }).catch(() => {});
+
     // Fetch deals from all connected CRMs in parallel
     const [hubspotDeals, salesforceDeals, invoices, subscriptions] = await Promise.all([
       hubspot.getDeals().catch(() => MOCK_DEALS),

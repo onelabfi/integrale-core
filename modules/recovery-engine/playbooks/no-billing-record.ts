@@ -66,8 +66,8 @@ function daysSince(isoDate: string): number {
 
 /* ── Credit cost calculation ───────────────────────────────────────── */
 
-function calcCreditsRequired(amount: number): number {
-  return Math.round(amount / 100);
+function calcCreditsRequired(_amount: number): number {
+  return 10; // Fixed: 1 token = €1, fix single issue = 10 tokens
 }
 
 /* ═══════════════════════════════════════════════════════════════════

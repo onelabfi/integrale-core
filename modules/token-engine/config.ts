@@ -11,8 +11,8 @@ import type { ActionType, TokenCostRule, PlanConfig, PlanTier, SafetyLimits } fr
  * Internal EUR cost model
  * ═══════════════════════════════════════════════════════════════════ */
 
-/** Internal cost per token in EUR — covers compute, API calls, infra */
-let TOKEN_COST_EUR = 0.0005; // €0.0005 per token → 1000 tokens = €0.50
+/** Internal cost per token in EUR — 1 token = €1 */
+let TOKEN_COST_EUR = 1.0; // €1 per token → user-facing pricing
 
 /** Minimum fee floor in EUR — no recovery fee can be less than this */
 let MIN_FEE_EUR = 50;
@@ -41,39 +41,52 @@ export function tokensToEuro(tokens: number): number {
 /* ═══════════════════════════════════════════════════════════════════
  * Token cost rules per action type
  * ═══════════════════════════════════════════════════════════════════ */
+/**
+ * Token costs aligned with RevCore pricing spec:
+ * - First scan: FREE (handled in API layer)
+ * - Re-scan: 25 tokens
+ * - Fix single issue: 10 tokens (handled in playbooks)
+ * - Fix all issues: 25–75 tokens (sum of individual, capped)
+ * - Execute recovery workflow: 25 tokens
+ * - Investigate issue (deep analysis): 75 tokens
+ * - Generate recovery report: 25 tokens
+ * - Continuous monitoring: 75 tokens
+ * - Deep system analysis: 75 tokens
+ * - Blueprint generation: 75 tokens
+ */
 const DEFAULT_TOKEN_COSTS: Record<ActionType, TokenCostRule> = {
   initial_scan: {
-    baseCost: 500,
-    perRecordCost: 1,
+    baseCost: 0,           // FREE — first scan is always free
+    perRecordCost: 0,
     perIssueCost: 0,
     discountMultiplier: 1.0,
   },
   rescan: {
-    baseCost: 500,
-    perRecordCost: 1,
+    baseCost: 25,          // Re-scan: 25 tokens
+    perRecordCost: 0,
     perIssueCost: 0,
-    discountMultiplier: 0.8, // 20% discount
+    discountMultiplier: 1.0,
   },
   continuous_sync: {
-    baseCost: 100,
-    perRecordCost: 0.5,
+    baseCost: 75,          // Continuous monitoring: 75 tokens
+    perRecordCost: 0,
     perIssueCost: 0,
     discountMultiplier: 1.0,
   },
   leak_detection: {
-    baseCost: 200,
-    perRecordCost: 0.5,
-    perIssueCost: 2,
+    baseCost: 75,          // Deep system analysis: 75 tokens
+    perRecordCost: 0,
+    perIssueCost: 0,
     discountMultiplier: 1.0,
   },
   fix_execution: {
-    baseCost: 50,
-    perRecordCost: 1, // per-record multiplier for complex fixes
+    baseCost: 10,          // Fix single issue: 10 tokens
+    perRecordCost: 0,
     perIssueCost: 0,
     discountMultiplier: 1.0,
   },
   preview: {
-    baseCost: 10,
+    baseCost: 0,           // Preview is always free
     perRecordCost: 0,
     perIssueCost: 0,
     discountMultiplier: 1.0,
@@ -206,6 +219,6 @@ export function resetConfig(): void {
   planConfigs = { ...PLAN_CONFIGS };
   safetyLimits = { ...DEFAULT_SAFETY_LIMITS };
   feeSchedule = [...DEFAULT_FEE_SCHEDULE];
-  TOKEN_COST_EUR = 0.0005;
+  TOKEN_COST_EUR = 1.0;
   MIN_FEE_EUR = 50;
 }

@@ -125,12 +125,15 @@ let autoRecoveryConfig: AutoRecoveryConfig = { ...DEFAULT_AUTO_RECOVERY_CONFIG }
 const tokenAccount = tokenEngine.getOrCreateAccount("default", "growth");
 console.log(`[TokenEngine] Initialized account: ${tokenAccount.tokenBalance} tokens (${tokenAccount.planTier} plan)`);
 
-/** Credit purchase plans */
+/** Credit purchase plans — 1 token = €1 */
 const CREDIT_PLANS = [
-  { id: "starter", price: 29, credits: 300, label: "Covers this recovery" },
-  { id: "growth", price: 79, credits: 900, label: "Covers all remaining issues", recommended: true },
-  { id: "scale", price: 199, credits: 2500, label: "Best value" },
+  { id: "starter", price: 50, credits: 50, label: "Fix a few issues" },
+  { id: "growth", price: 100, credits: 100, label: "Full recovery", recommended: true },
+  { id: "scale", price: 200, credits: 200, label: "Recovery + monitoring" },
 ] as const;
+
+/** Track whether first scan has been used (free) */
+let firstScanUsed = false;
 
 // ── GET /api/connectors ────────────────────────────────────────────
 app.get("/api/connectors", (_req, res) => {
@@ -512,6 +515,20 @@ app.get("/api/recovery/scan", async (_req, res) => {
       },
     };
 
+    // Track first scan (free) vs re-scan (25 tokens)
+    if (!firstScanUsed) {
+      firstScanUsed = true;
+      console.log("[Scan] First scan — FREE");
+    } else {
+      // Re-scan costs 25 tokens
+      if (userCredits >= 25) {
+        userCredits -= 25;
+        console.log(`[Scan] Re-scan — deducted 25 tokens. Balance: ${userCredits}`);
+      } else {
+        console.warn(`[Scan] Re-scan — insufficient tokens (${userCredits}). Scan proceeds but no deduction.`);
+      }
+    }
+
     res.json({
       status: "ok",
       opportunities: finalEnriched,
@@ -520,6 +537,7 @@ app.get("/api/recovery/scan", async (_req, res) => {
       sources,
       scannedSources,
       credits: userCredits,
+      firstScanFree: !firstScanUsed, // false after first scan is used
       autoRecovery: autoResult,
       scannedAt: new Date().toISOString(),
       safety: {

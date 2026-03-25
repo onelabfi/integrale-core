@@ -118,7 +118,7 @@ let leaks: RevenueLeak[] = [];
 let lastScan: string | null = null;
 
 // ── User credits & auto-recovery state ──────────────────────────────
-let userCredits = 500;
+let userCredits = 1000;
 let autoRecoveryConfig: AutoRecoveryConfig = { ...DEFAULT_AUTO_RECOVERY_CONFIG };
 
 // ── Token engine — internal cost tracking (never exposed to users) ──

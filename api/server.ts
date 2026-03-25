@@ -40,6 +40,7 @@ import * as tokenEngine from "../modules/token-engine/index.js";
 import * as pdfGenerator from "../modules/pdf-generator/index.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
 import * as findingsService from "../services/findingsService.js";
+import { invalidateCache as invalidateSalesforceCache } from "../lib/salesforceTokenManager.js";
 
 const app = express();
 
@@ -160,6 +161,7 @@ app.post("/api/connectors/:name/connect", async (req, res) => {
     } else if (name === "stripe") {
       await stripe.connect({ apiKey: process.env.STRIPE_SECRET_KEY });
     } else if (name === "salesforce") {
+      invalidateSalesforceCache(); // Always fetch fresh token from Supabase
       await salesforce.connect({ orgId });
     } else if (name === "sap") {
       await sap.connect({ apiKey: process.env.SAP_API_KEY });

@@ -121,6 +121,10 @@ let lastScan: string | null = null;
 let userCredits = 1000;
 let autoRecoveryConfig: AutoRecoveryConfig = { ...DEFAULT_AUTO_RECOVERY_CONFIG };
 
+// ── Track all successfully fixed opportunities (for cumulative reports) ──
+import type { RecoveryOpportunity } from "../modules/recovery-engine/types.js";
+const fixedOpportunities: RecoveryOpportunity[] = [];
+
 // ── Token engine — internal cost tracking (never exposed to users) ──
 const tokenAccount = tokenEngine.getOrCreateAccount("default", "growth");
 console.log(`[TokenEngine] Initialized account: ${tokenAccount.tokenBalance} tokens (${tokenAccount.planTier} plan)`);
@@ -680,6 +684,11 @@ app.post("/api/recovery/execute/:id", async (req, res) => {
         `[TokenEngine] Recovery: ${feeRecord.recoveredAmount}€ → fee ${feeRecord.finalFee.toFixed(2)}€ (${(feeRecord.appliedPercentage * 100).toFixed(1)}%) | ` +
         `cost ${feeRecord.costEur.toFixed(4)}€ | margin ${feeRecord.marginEur.toFixed(2)}€`
       );
+    }
+
+    // Track fixed opportunity for cumulative report
+    if (result.success) {
+      fixedOpportunities.push(opportunity);
     }
 
     // Generate recovery report PDF (on success)
@@ -1260,6 +1269,36 @@ app.get("/api/reports", (_req, res) => {
     count: reports.length,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ── POST /api/reports/cumulative ─────────────────────────────────
+// Generate a cumulative recovery report PDF for all fixed items.
+app.post("/api/reports/cumulative", async (_req, res) => {
+  try {
+    const fixedItems = fixedOpportunities;
+
+    if (fixedItems.length === 0) {
+      res.status(400).json({ error: "No fixed items to report", timestamp: new Date().toISOString() });
+      return;
+    }
+
+    const report = await pdfGenerator.generateCumulativeReport(
+      fixedItems,
+      "default",
+      "RevCore Workspace",
+    );
+
+    res.json({
+      status: "ok",
+      reportId: report.reportId,
+      totalRecovered: report.summary.totalRecovered,
+      issuesResolved: report.summary.issuesResolved,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error("[Reports] Cumulative report failed:", err);
+    res.status(500).json({ error: String(err), timestamp: new Date().toISOString() });
+  }
 });
 
 // ── GET /api/reports/:reportId/download ──────────────────────────

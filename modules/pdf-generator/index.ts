@@ -427,3 +427,76 @@ export async function generateAndStoreReport(
   storeReport(workspaceId, stored);
   return stored;
 }
+
+/* ── Cumulative report: all fixed items in one PDF ───────────────── */
+export async function generateCumulativeReport(
+  fixedOpportunities: RecoveryOpportunity[],
+  workspaceId = "default",
+  workspaceName = "RevCore Workspace",
+  logoPath?: string,
+): Promise<StoredReport> {
+  const reportId = `RPT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
+  const now = new Date().toISOString();
+
+  const totalRecovered = fixedOpportunities.reduce((s, o) => s + o.amount, 0);
+  const allSystems = new Set<string>();
+  const items: RecoveryReportItem[] = [];
+  const audit: AuditEntry[] = [];
+
+  for (const opp of fixedOpportunities) {
+    if (opp.source === "hubspot" || opp.source === "salesforce") allSystems.add("CRM");
+    else allSystems.add("CRM");
+    if (opp.playbook !== "missed_renewal") allSystems.add("Billing");
+
+    items.push({
+      issueType: playbookLabel(opp.playbook),
+      description: opp.description,
+      amount: opp.amount,
+      currency: opp.currency || "EUR",
+      actions: outcomeActions(opp.playbook),
+      playbook: opp.playbook,
+    });
+
+    audit.push({
+      timestamp: now,
+      actionId: opp.id,
+      status: "Completed",
+      idempotent: true,
+    });
+  }
+
+  const data: RecoveryReportData = {
+    reportId,
+    recoveryId: fixedOpportunities[0]?.id ?? "cumulative",
+    workspaceName,
+    generatedAt: now,
+    summary: {
+      totalRecovered,
+      currency: "EUR",
+      issuesResolved: fixedOpportunities.length,
+      systemsInvolved: [...allSystems],
+      executionTimeMs: 0,
+    },
+    items,
+    audit,
+  };
+
+  const buffer = await generateRecoveryReport(data, logoPath);
+
+  const stored: StoredReport = {
+    reportId,
+    recoveryId: "cumulative",
+    workspaceId,
+    generatedAt: now,
+    fileName: `recovery-report-${reportId}.pdf`,
+    buffer,
+    summary: {
+      totalRecovered,
+      currency: "EUR",
+      issuesResolved: fixedOpportunities.length,
+    },
+  };
+
+  storeReport(workspaceId, stored);
+  return stored;
+}
